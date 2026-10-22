@@ -127,6 +127,52 @@ test('end to end: attribution, staging one agent, commit, discard', async () => 
   assert.equal(snap.files.has('y.txt'), false);
 });
 
+test('two selected commits preserve ownership across a fresh tracker', async () => {
+  const dir = setupRepo();
+  const read = () => fs.readFileSync(path.join(dir, 'a.txt'), 'utf8');
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+  const base = git('rev-parse', 'HEAD').trim();
+  const writerText = ten.replace('line 9\n', 'line nine\n');
+  const both = writerText.replace('line 2\n', 'line two\n');
+  edit(dir, {}, 'a.txt', 'line 2\n', 'line two\n');
+  edit(dir, writer, 'a.txt', 'line 9\n', 'line nine\n');
+
+  const tracker = (await Tracker.open(dir))!;
+  await tracker.setStaged(['a.txt'], WRITER, true);
+  assert.equal(git('show', ':a.txt'), writerText);
+  assert.equal(read(), both, "staging the writer leaves both agents' working edits in place");
+  await tracker.commit('Writer first');
+  const first = git('rev-parse', 'HEAD').trim();
+  assert.equal(git('rev-parse', `${first}^`).trim(), base);
+  assert.equal(git('show', `${first}:a.txt`), writerText);
+  assert.equal(git('diff', '--cached'), '');
+  assert.equal(read(), both);
+
+  // Reopen before computing again: the durable checkpoint still has the old HEAD.
+  const reopened = (await Tracker.open(dir))!;
+  let snap = await reopened.compute();
+  assert.equal(snap.head, first);
+  assert.deepEqual([...snap.files.keys()], ['a.txt']);
+  assert.deepEqual(snap.files.get('a.txt')!.owners, [MAIN]);
+  assert.deepEqual(snap.files.get('a.txt')!.unstaged, [MAIN]);
+  assert.deepEqual(snap.staged, []);
+
+  await reopened.setStaged(['a.txt'], MAIN, true);
+  assert.equal(git('show', ':a.txt'), both);
+  await reopened.commit('Main follows');
+  const second = git('rev-parse', 'HEAD').trim();
+  assert.equal(git('rev-parse', `${second}^`).trim(), first);
+  assert.equal(git('show', `${first}:a.txt`), writerText);
+  assert.equal(git('show', `${second}:a.txt`), both);
+  assert.equal(git('write-tree').trim(), git('rev-parse', 'HEAD^{tree}').trim(), 'index equals HEAD');
+  assert.equal(read(), both);
+  assert.equal(git('status', '--porcelain'), '');
+  snap = await reopened.compute();
+  assert.equal(snap.files.size, 0);
+  assert.deepEqual(snap.staged, []);
+  assert.deepEqual(snap.owners, []);
+});
+
 test('overlapping shell commands from different agents are left unattributed', async () => {
   const dir = setupRepo();
   const pre = (who: object, id: string) =>
